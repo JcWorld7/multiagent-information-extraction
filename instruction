@@ -1,0 +1,793 @@
+# Labelcentered Project Instruction
+
+This document explains what the Labelcentered project does, how the current scripts fit together, and the recommended workflow for running extraction, comparing LLM backends, and evaluating final spans.
+
+The project is a label-centered PICO extraction pipeline. It starts from method/results text in PDFs or Label Studio JSON records, uses three fixed fine-tuned encoder extractors to create token-level candidate spans, then uses LLM-based agents to adjudicate which candidate spans should be selected as the final answer.
+
+The seven target labels are fixed in `settings.py`:
+
+1. Participant
+2. Intervention
+3. Outcome
+4. SampleSize
+5. ComparisonGroup
+6. DesignDescription
+7. StatisticalAnalysis
+
+The three expert extractors are also fixed:
+
+1. SciBERT
+2. PubMedBERT
+3. ClinicalBERT
+
+The intended experimental variable is the LLM agent backend, not the expert extractors, thresholds, candidate registry, or source text.
+
+
+## High-Level Architecture
+
+The core pipeline is:
+
+```text
+Input PDF or Label Studio JSON
+        |
+        v
+Build model_input_text from methods/results
+        |
+        v
+Three fine-tuned expert extractors
+  - SciBERT
+  - PubMedBERT
+  - ClinicalBERT
+        |
+        v
+CandidateRegistry
+  - validates source offsets
+  - merges exact duplicates
+  - assigns label-specific candidate IDs
+  - keeps provenance from expert models
+        |
+        v
+Deterministic pre-expansion
+  - adds source-grounded candidates before LLM review
+  - targets Participant, Intervention, Outcome, and SampleSize
+  - creates cue phrases, number-centered spans, and boundary alternatives
+        |
+        v
+For each label:
+  3 DoctorAgents review all candidates
+        |
+        v
+LabelMetaAgent selects candidate IDs or requests exact source-grounded expansion
+        |
+        v
+Consensus/selection policy chooses final candidate IDs
+        |
+        v
+GlobalMetaAgent assembles final spans and checks cross-label conflicts
+        |
+        v
+Output .labelcentered.json files
+        |
+        v
+Evaluation scripts compute exact span, relaxed span, character, and token metrics
+```
+
+Important invariant: final spans must come from validated candidate IDs in the registry. LLM agents do not directly create arbitrary final text/offsets. If an agent wants a new span, it must request a source-grounded expansion, and the deterministic registry/expansion logic verifies that text against the source before assigning a new candidate ID.
+
+
+## Main Files
+
+### Configuration
+
+`settings.py`
+
+Defines labels, expert model checkpoint paths, LLM backend definitions, default output directories, and `PipelineSettings`.
+
+Configured LLM backends:
+
+```text
+qwen         -> Qwen/Qwen2.5-7B-Instruct
+llama31_8b  -> meta-llama/Llama-3.1-8B-Instruct
+mistral7b   -> mistralai/Mistral-7B-Instruct-v0.3
+```
+
+Default backend output folders are:
+
+```text
+outputs/qwen/
+outputs/llama31_8b/
+outputs/mistral7b/
+```
+
+### Input Handling
+
+`json_input.py`
+
+Loads Label Studio JSON records, builds model input text from method/results fields, derives record names, and creates safe output filenames.
+
+`pdf_input.py`
+
+Extracts source text from PDF files for PDF-based runs.
+
+### Expert Extractors
+
+`expert_models.py`
+
+Loads the three fixed expert extractors, applies the threshold files, and produces raw candidate spans per expert and label.
+
+The expert extractors and threshold files should not be changed for backend comparison experiments. They define the shared candidate source for all LLM backends.
+
+### Candidate Registry And Expansion
+
+`candidate_registry.py`
+
+Creates label-specific candidate banks. It validates offsets, enforces exact source text, merges duplicate candidates, tracks expert provenance, and assigns IDs such as:
+
+```text
+PAR-C0001
+OUT-C0003
+STA-C0012
+```
+
+`candidate_cleaning.py`
+
+Contains deterministic boundary-quality checks and candidate rejection/cleanup helpers.
+
+`candidate_expansion.py`
+
+Allows LabelMetaAgents to request new candidates by exact quote, sentence expansion, or controlled operations. Expansion is source-grounded and registry-validated.
+
+Also runs deterministic pre-expansion before LLM review by default. This raises
+registry oracle recall by appending valid exact-source candidates for
+Participant, Intervention, Outcome, and SampleSize before doctors see the label
+banks. Use `--disable_deterministic_pre_expansion` only for ablation.
+
+### Agents
+
+`label_doctor.py`
+
+Defines DoctorAgents. For each label, there are three doctors linked to the three expert models:
+
+```text
+SciBERT_<Label>_Doctor
+PubMedBERT_<Label>_Doctor
+ClinicalBERT_<Label>_Doctor
+```
+
+Each doctor sees the candidates for one label plus compact source sentence IDs, then returns keep/reject decisions for every visible candidate ID. Doctors may also indicate missing labels or request exact-quote candidate expansion; validated doctor proposals are appended to the registry and reviewed in the next round.
+
+`label_meta_agent.py`
+
+Defines one LabelMetaAgent per label. The LabelMetaAgent receives doctor votes, candidate context, relevant source units, and RAG/codebook guidelines. It selects existing candidate IDs and can request exact source-grounded expansion.
+
+The current prompt asks the LabelMetaAgent to provide evidence through source sentence IDs and exact quotes. This is meant to make selection more source-grounded and to support rescue when candidate boundaries are poor.
+
+`global_meta_agent.py`
+
+Assembles final candidate IDs into final span payloads and checks global consistency, including cross-label conflicts.
+
+`summary_agent.py`
+
+Optional. Generates summaries after extraction is frozen if `--generate_summaries` is used.
+
+### LLM Client
+
+`llm_client.py`
+
+Uses an OpenAI-compatible API endpoint, usually vLLM at:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
+It supports structured JSON output, repairs invalid JSON, and has an unstructured JSON fallback for models that do not reliably support vLLM structured outputs.
+
+It also checks whether the vLLM server is serving the exact expected model name before running, unless `--skip_llm_model_check` is passed.
+
+### RAG Guidelines
+
+`rag_retriever.py`
+
+Loads static and document-based label guidelines. The `RAG_Documents/` folder contains codebook/guideline documents used to improve label definitions in prompts.
+
+### Consultation Orchestration
+
+`consultation.py`
+
+This is the main pipeline orchestrator. For each record, it:
+
+1. Builds the candidate registry from raw expert candidates.
+2. Segments source text into source units/sentences.
+3. Runs label-specific DoctorAgents.
+4. Computes consistency and vote matrices.
+5. Runs each LabelMetaAgent.
+6. Handles source-grounded candidate expansion.
+7. Applies the final selection policy.
+8. Runs GlobalMetaAgent assembly.
+9. Returns the full output payload.
+
+### Selection Policy
+
+`selection_policy.py`
+
+Contains deterministic selection policies and label filters.
+
+`calibration.py`
+
+Contains the portable calibrated lightweight candidate selector used by both
+calibration scripts and `--final_selection_policy calibrated` production runs.
+
+Current final selection options:
+
+```text
+strict
+pubmedbert_plus_verified
+expert_consensus_verified
+```
+
+`expert_consensus_verified` is the default. It treats SciBERT, PubMedBERT, and ClinicalBERT equally:
+
+```text
+Candidate proposed by two or more expert models:
+    keep if it passes label-specific deterministic filters
+    and is not a weak fragment
+
+Candidate proposed by one expert or by registry expansion:
+    add only if at least 2 of 3 doctors vote keep
+    or it passes a narrow high-quality rescue rule for Outcome, SampleSize, or ComparisonGroup
+    and it is not redundant with a stronger candidate
+```
+
+`strict` preserves the original unanimous-consensus final selection behavior.
+
+`pubmedbert_plus_verified` is the newer experimental policy. It treats PubMedBERT as the anchor selector:
+
+```text
+PubMedBERT candidate:
+    keep if it passes label-specific deterministic filters
+
+Non-PubMedBERT candidate:
+    add only if at least 2 of 3 doctors vote keep
+    and it passes label-specific deterministic filters
+    and it is not redundant with a PubMedBERT anchor
+```
+
+`pubmedbert_plus_verified` is retained as an ablation and historical baseline, but it should not be the default when all expert models must be treated equally.
+
+### Output Validation
+
+`output_validation.py`
+
+Validates output payloads. For the `strict` policy, final candidates must be supported by three keep votes. For equal-expert and other verified policies, validation allows deterministic policy-selected candidates because those rules are intentionally not identical to unanimous consensus.
+
+### Evaluation
+
+`evaluate_labelcentered.py`
+
+Evaluates `.labelcentered.json` prediction files against Label Studio gold JSON.
+
+It reports:
+
+1. Final exact span precision, recall, and F1.
+2. Relaxed span metrics at IoU thresholds such as 0.5 and 0.75.
+3. Character-level metrics.
+4. Strict token-level metrics for final spans:
+   - per-label precision
+   - per-label recall
+   - per-label F1
+   - per-label one-vs-rest accuracy
+   - micro/macro token metrics
+   - overall token assignment accuracy
+5. Registry oracle diagnostics.
+6. Consensus coverage.
+7. Selection ablations.
+8. Gold annotation offset/text repair diagnostics.
+
+Gold annotation repair is used only for evaluation alignment. It does not change model outputs.
+
+### Calibration Scripts
+
+Calibration is intentionally separated from expensive extraction. Run BERT and
+LLM agents once, save `.labelcentered.json` outputs, build a compact cache of
+gold spans, token offsets, registry candidates, and doctor votes, then tune only
+the final selection rules offline.
+
+`make_labelcentered_calibration_splits.py`
+
+Builds `dev_small.json`, `dev_check.json`, and `test.json` from the IDAS default
+annotated dataset paths in `settings.DEFAULT_DATASET_PATHS`. Use 30-50 records
+for `dev_small`, about 50 for `dev_check`, and keep the rest for final test.
+
+`build_labelcentered_calibration_cache.py`
+
+Builds a compact cache from gold JSON files plus one-time Labelcentered
+prediction payloads. The cache lets calibration run repeatedly without reparsing
+large outputs or rerunning BERT/LLM agents.
+
+`tune_labelcentered_calibration.py`
+
+Tunes a per-label calibration config from one or more cache files. The grid
+search covers vote thresholds, expert confidence thresholds, high-quality rescue
+rules, and equal or optionally weighted doctor-vote profiles. It can compare
+prediction variants, including caches generated with and without
+`--normalize_candidate_boundaries`.
+
+`apply_labelcentered_calibration.py`
+
+Applies a learned calibration config to existing `.labelcentered.json` files and
+writes calibrated copies. This lets you evaluate calibrated final spans without
+rerunning the BERT expert extractors or the LLM agents.
+
+For new extraction runs, use:
+
+```bash
+--final_selection_policy calibrated --calibration_config ./labelcentered_calibration.json
+```
+
+Selection ablations include:
+
+```text
+final
+recommended
+pubmedbert_only
+majority_vote
+pubmedbert_anchor
+pubmedbert_plus_verified
+expert_consensus_verified
+registry_filtered
+registry_all
+```
+
+The deterministic ablations are recomputed from each output payload's registry and vote matrices, so existing `.labelcentered.json` files can be re-evaluated without rerunning the LLM.
+
+### Backend Comparison
+
+`compare_llm_backends.py`
+
+Evaluates output folders for multiple LLM backends and writes a comparison summary. It compares token-level precision, recall, F1, and accuracy overall and per label.
+
+### vLLM Launcher
+
+`scripts/start_vllm_backend.sh`
+
+Starts one vLLM backend at a time. It maps backend keys to Hugging Face model IDs and uses `--served-model-name` with the exact model name so the OpenAI-compatible requests do not fail with model-name mismatches.
+
+For Llama 3.1 8B, use `HF_TOKEN` in the environment or run `huggingface-cli login` before starting vLLM. Do not hard-code Hugging Face access tokens in project files.
+
+
+## Standard Workflow
+
+### 1. Activate the vLLM environment and start one backend
+
+On IDAS, use the vLLM environment:
+
+```bash
+source /home/zhf/vllm-cu128/bin/activate
+```
+
+Start Qwen:
+
+```bash
+Labelcentered/scripts/start_vllm_backend.sh qwen
+```
+
+Start Llama 3.1 8B:
+
+```bash
+export HF_TOKEN=your_huggingface_token_here
+Labelcentered/scripts/start_vllm_backend.sh llama31_8b
+```
+
+or use `huggingface-cli login` instead of exporting `HF_TOKEN`.
+
+Start Mistral:
+
+```bash
+Labelcentered/scripts/start_vllm_backend.sh mistral7b
+```
+
+Only one model normally runs on port 8000 at a time. Before running extraction, check that the server is alive:
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+The returned model ID should match the `--llm_backend` selected for the run.
+
+
+### 2. Activate the Python project environment
+
+In another terminal:
+
+```bash
+source /home/zhf/myenv/bin/activate
+cd /home/zhf/hpchome/ModelForPICO/ExtractiveModel/Agent
+```
+
+
+### 3. Run JSON extraction
+
+Default equal-expert verified policy:
+
+```bash
+python Labelcentered/run_json_labelcentered.py \
+  --json ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --llm_backend qwen \
+  --out_dir ./Outputs2/qwen \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+Historical PubMedBERT-first verified ablation:
+
+```bash
+python Labelcentered/run_json_labelcentered.py \
+  --json ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --llm_backend qwen \
+  --out_dir ./Outputs2/qwen_pubmedbert_plus_verified \
+  --final_selection_policy pubmedbert_plus_verified \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+Run only the first record as a smoke test:
+
+```bash
+python Labelcentered/run_json_labelcentered.py \
+  --json ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --llm_backend qwen \
+  --out_dir ./Outputs2/qwen_expert_consensus_verified_test1 \
+  --final_selection_policy expert_consensus_verified \
+  --limit_records 1 \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+Use `--skip_existing` when resuming a partially completed folder:
+
+```bash
+python Labelcentered/run_json_labelcentered.py \
+  --json ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --llm_backend qwen \
+  --out_dir ./Outputs2/qwen \
+  --skip_existing \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+
+### 4. Run PDF extraction
+
+```bash
+python Labelcentered/run_pdf_labelcentered.py \
+  --pdf ./example.pdf \
+  --llm_backend qwen \
+  --out_dir ./pdf_outputs/qwen \
+  --save_text \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+
+### 5. Evaluate one output folder
+
+```bash
+python Labelcentered/evaluate_labelcentered.py \
+  --gold ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --pred_dir ./Outputs2/qwen \
+  --out_json ./Outputs2/qwen/evaluation.json \
+  --out_txt ./Outputs2/qwen/evaluation.txt
+```
+
+For a one-record smoke test, evaluation will show:
+
+```text
+Gold records: 10
+Prediction payloads: 1
+Aligned records: 1
+```
+
+That is expected. The metrics are only for the aligned record(s), so a one-record test is for checking the pipeline, not for final conclusions.
+
+
+### 6. Compare multiple backends
+
+After running Qwen, Llama, and Mistral into separate folders, compare them:
+
+```bash
+python Labelcentered/compare_llm_backends.py \
+  --gold ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --outputs_root ./Outputs2 \
+  --backends qwen llama31_8b mistral7b \
+  --report_dir ./Outputs2/comparison
+```
+
+This writes:
+
+```text
+Outputs2/comparison/llm_backend_comparison.json
+Outputs2/comparison/llm_backend_comparison.csv
+Outputs2/comparison/llm_backend_comparison.txt
+```
+
+Note: `compare_llm_backends.py` expects backend folders named by backend key under `--outputs_root`, for example:
+
+```text
+Outputs2/qwen/
+Outputs2/llama31_8b/
+Outputs2/mistral7b/
+```
+
+If you use custom folder names such as `qwen_pubmedbert_plus_verified`, run `evaluate_labelcentered.py` directly on those folders, or copy/organize outputs into backend-key folders before using the comparison script.
+
+
+## Output File Structure
+
+Each processed record produces one file ending in:
+
+```text
+.labelcentered.json
+```
+
+Important fields in each output file:
+
+```text
+source_file
+record_index
+record_name
+model_input_text
+llm_backend
+llm_model
+llm_agent_backend
+expert_models
+thresholds_by_expert_and_label
+raw_candidates_by_expert_and_label
+label_candidate_registries
+candidate_vote_matrices_by_label
+label_meta_decisions
+latest_label_meta_decisions
+strict_global_meta_decision
+global_meta_decision
+final_selection_policy
+final_candidate_ids_by_label
+recommended_candidate_ids_by_label
+alternative_candidate_ids_by_mode
+alternative_spans_by_mode
+final_spans_by_label
+final_spans
+missing_labels
+cross_label_conflicts
+overall_consensus_reached
+```
+
+The most important output fields for evaluation are:
+
+```text
+final_spans_by_label
+final_candidate_ids_by_label
+label_candidate_registries
+candidate_vote_matrices_by_label
+alternative_candidate_ids_by_mode
+alternative_spans_by_mode
+```
+
+
+## Important Experimental Rules
+
+For fair LLM backend comparison:
+
+1. Keep the three expert extractors unchanged.
+2. Keep the threshold files unchanged.
+3. Keep the candidate registry logic unchanged unless there is a true bug.
+4. Keep source inputs identical.
+5. Keep decoding settings as consistent as possible, especially `--llm_temperature 0`.
+6. Save each backend into a separate output folder.
+7. Compare the same aligned records across backends.
+8. Do not hard-code Hugging Face tokens.
+
+Recommended output layout:
+
+```text
+Outputs2/qwen/
+Outputs2/llama31_8b/
+Outputs2/mistral7b/
+```
+
+For policy experiments, use explicit folder names:
+
+```text
+Outputs2/qwen_strict/
+Outputs2/qwen_pubmedbert_plus_verified/
+```
+
+
+## Understanding The Metrics
+
+### Exact span metrics
+
+Exact span metrics require label, start offset, and end offset to match the gold annotation exactly. These are very strict. A span with the right meaning but one extra word will be counted as false positive and false negative.
+
+### Relaxed span metrics
+
+Relaxed span metrics use character intersection-over-union. They are useful when boundaries are close but not exact.
+
+### Character-level metrics
+
+Character-level metrics show whether predicted spans overlap the right gold text, even when exact boundaries differ.
+
+### Token-level metrics
+
+Token-level metrics are usually the most important for the current experiments. They evaluate final selected spans at the token level and report:
+
+```text
+precision
+recall
+F1
+accuracy
+```
+
+Overall token assignment accuracy is different from one-vs-rest accuracy. One-vs-rest accuracy can look very high because most tokens are negative for each label. Token F1 is usually more informative for extraction quality.
+
+### Registry oracle recall
+
+Registry oracle recall asks: if the selection layer were perfect, how much gold could be recovered from all candidates in the registry?
+
+If registry oracle recall is much higher than final F1, the problem is selection/filtering, not candidate generation.
+
+### Selection ablations
+
+Use selection ablations to understand where errors come from:
+
+```text
+pubmedbert_only
+majority_vote
+pubmedbert_anchor
+pubmedbert_plus_verified
+registry_filtered
+registry_all
+```
+
+If `pubmedbert_only` beats `final`, the multi-agent layer is hurting precision or selection quality. If `registry_all` has much higher recall but low precision, the registry contains useful candidates but needs better filtering.
+
+
+## Current Interpretation From Recent Runs
+
+Recent results showed this pattern:
+
+```text
+PubMedBERT-only: strongest current production baseline
+Final strict multi-agent: slightly higher recall but much lower precision
+Majority vote: higher recall but too many false positives
+Registry all: useful oracle signal but poor filtering
+```
+
+Therefore, the current best next experiment is:
+
+```text
+pubmedbert_plus_verified
+```
+
+This makes PubMedBERT the anchor and uses the LLM agents as conservative verification/rescue, not as the primary selector.
+
+
+## Common Problems And Fixes
+
+### Connection error
+
+Usually vLLM is not running, is running on a different port, or the Python script is pointing at the wrong base URL.
+
+Check:
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+Then make sure `--llm_backend` matches the served model.
+
+### Model 404
+
+The served model name does not match the requested model name. Use:
+
+```bash
+Labelcentered/scripts/start_vllm_backend.sh <backend>
+```
+
+or pass the exact served model name with `--llm_model`.
+
+### Permission denied when running start script
+
+Run it through bash:
+
+```bash
+bash Labelcentered/scripts/start_vllm_backend.sh qwen
+```
+
+or make it executable:
+
+```bash
+chmod +x Labelcentered/scripts/start_vllm_backend.sh
+```
+
+### Request timed out
+
+The model may be slow or the prompt may be too large. Try:
+
+```text
+--doctor_batch_size 3
+--llm_max_tokens 2048
+--llm_timeout_seconds 1800
+--llm_temperature 0
+--skip_existing
+```
+
+### Invalid LLM structured output
+
+This is more common with Mistral. The client already attempts JSON repair and an unstructured fallback, but some records may still fail. Smaller doctor batches and more output tokens can help.
+
+### Gold annotation text/source mismatches
+
+The evaluator now attempts offset/text repair for Label Studio annotations when whitespace or escaped newlines cause mismatches. The report distinguishes:
+
+```text
+Gold annotation text/source mismatches
+Gold annotation offset/text repairs
+```
+
+A mismatch count of 0 with repairs > 0 means evaluation alignment was repaired successfully.
+
+
+## Recommended Smoke Test Before A Full Run
+
+Before running all 10 records, run one record:
+
+```bash
+python Labelcentered/run_json_labelcentered.py \
+  --json ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --llm_backend qwen \
+  --out_dir ./Outputs2/qwen_test1 \
+  --limit_records 1 \
+  --doctor_batch_size 10 \
+  --max_rounds 3 \
+  --llm_max_tokens 2048 \
+  --llm_temperature 0
+```
+
+Then evaluate:
+
+```bash
+python Labelcentered/evaluate_labelcentered.py \
+  --gold ./Labelcentered/Ex_171_180_Mar.3_2026.json \
+  --pred_dir ./Outputs2/qwen_test1 \
+  --out_json ./Outputs2/qwen_test1/evaluation.json \
+  --out_txt ./Outputs2/qwen_test1/evaluation.txt
+```
+
+If the output validates and evaluation aligns one record, then run all 10 records.
+
+
+## Development Checks
+
+Run the test suite from inside the Labelcentered folder:
+
+```bash
+PYTHONPYCACHEPREFIX=/private/tmp/labelcentered_pycache python3 -m unittest discover -s tests -v
+```
+
+The test suite covers backend settings, candidate registry, expansion, consensus, doctor completeness, LLM JSON parsing, output validation, RAG guideline retrieval, evaluation, and the selection policy.
+
+
+## Practical Summary
+
+The project compares LLM agent backends for a fixed extraction pipeline. The three encoder expert models create candidate spans. The LLM agents review and adjudicate candidates, but final spans must always come from the validated registry. Evaluation focuses on final selected spans, especially token-level precision, recall, F1, and accuracy.
+
+For current experiments, use `expert_consensus_verified` as the default equal-expert production policy, `strict` as the original unanimous-consensus baseline, and `pubmedbert_plus_verified` only as a historical PubMedBERT-first ablation. Re-evaluate existing outputs to inspect ablations, and rerun extraction only when you need the selected final output itself to use a different final selection policy.
